@@ -1,4 +1,5 @@
 import { PrismaClient, ContractStatus, PropertyStatus, DocumentType, DocumentStatus } from "../generated/prisma/index.js";
+import { AzureLogger } from "./azureLogger.js";
 import { BlobServiceClient, StorageSharedKeyCredential, BlobSASPermissions, generateBlobSASQueryParameters } from "@azure/storage-blob";
 import PDFDocument from "pdfkit";
 import { v4 as uuidv4 } from 'uuid';
@@ -34,81 +35,113 @@ const containerClient = blobServiceClient.getContainerClient(containerName);
 // --- Business Rules ---
 
 const createContractFromRental = async (rental) => {
+    AzureLogger.info("[createContractFromRental] Start", { rentalId: rental?.id });
     // Verify that a contract does not already exist for this rental
     if (!rental || !rental.id) {
+        AzureLogger.error(new Error("Valid rental object must be provided."), { rental });
         throw { status: 400, message: "Valid rental object must be provided." };
     }
-    
-    const fullRental = await prisma.rental.findUnique({
-        where: { id: rental.id },
-        include: { property: true },
-    });
-    if (!fullRental) throw { status: 404, message: "Rental not found." };
-    if (fullRental.status !== 'ACCEPTED') throw { status: 400, message: 'Contract can only be created from an accepted rental.' };
-
-    const existingContract = await prisma.contract.findUnique({
-        where: { rentalId: rental.id }
-    });
-    if (existingContract) {
-        console.warn(`Attempted to create a duplicate contract for rental ID: ${rental.id}`);
-        return existingContract;
-    }
-
-    // Use rental and property data to create the contract
-
-    const property = await prisma.property.findUnique({ where: { id: rental.propertyId } });
-    if (!property) {
-        throw new Error(`Property with ID ${rental.propertyId} not found for rental ID ${rental.id}`);
-    }
-
-    return prisma.contract.create({
-        data: {
-            rentalId: fullRental.id,
-            propertyId: fullRental.propertyId,
-            tenantId: fullRental.renterId,
-            landlordId: fullRental.property.ownerId,
-            startDate: new Date(), // Placeholder
-            endDate: new Date(new Date().setFullYear(new Date().getFullYear() + 1)), // Placeholder, +1 año
-            monthlyRent: fullRental.property.price,
-            terms: `Términos y condiciones estándar para la propiedad ubicada en ${fullRental.property.address}. El pago mensual se realizará los primeros cinco días de cada mes.`, // Placeholder
-            status: ContractStatus.DRAFT,
+    try {
+        const fullRental = await prisma.rental.findUnique({
+            where: { id: rental.id },
+            include: { property: true },
+        });
+        if (!fullRental) {
+            AzureLogger.error(new Error("Rental not found."), { rentalId: rental.id });
+            throw { status: 404, message: "Rental not found." };
         }
-    });
+        if (fullRental.status !== 'ACCEPTED') {
+            AzureLogger.error(new Error('Contract can only be created from an accepted rental.'), { rentalId: rental.id });
+            throw { status: 400, message: 'Contract can only be created from an accepted rental.' };
+        }
+
+        const existingContract = await prisma.contract.findUnique({
+            where: { rentalId: rental.id }
+        });
+        if (existingContract) {
+            AzureLogger.warn(`Attempted to create a duplicate contract for rental ID: ${rental.id}`);
+            return existingContract;
+        }
+
+        // Use rental and property data to create the contract
+        const property = await prisma.property.findUnique({ where: { id: rental.propertyId } });
+        if (!property) {
+            AzureLogger.error(new Error(`Property with ID ${rental.propertyId} not found for rental ID ${rental.id}`));
+            throw new Error(`Property with ID ${rental.propertyId} not found for rental ID ${rental.id}`);
+        }
+
+        const contract = await prisma.contract.create({
+            data: {
+                rentalId: fullRental.id,
+                propertyId: fullRental.propertyId,
+                tenantId: fullRental.renterId,
+                landlordId: fullRental.property.ownerId,
+                startDate: new Date(), // Placeholder
+                endDate: new Date(new Date().setFullYear(new Date().getFullYear() + 1)), // Placeholder, +1 año
+                monthlyRent: fullRental.property.price,
+                terms: `Términos y condiciones estándar para la propiedad ubicada en ${fullRental.property.address}. El pago mensual se realizará los primeros cinco días de cada mes.`, // Placeholder
+                status: ContractStatus.DRAFT,
+            }
+        });
+        AzureLogger.info("[createContractFromRental] Success", { contractId: contract.id });
+        return contract;
+    } catch (err) {
+        AzureLogger.error(err, { rentalId: rental?.id, operation: "createContractFromRental" });
+        throw err;
+    }
 };
 
 const getContractById = async (contractId, userId) => {
-    const contract = await prisma.contract.findUnique({
-        where: { id: contractId },
-        include: {
-            landlord: { select: { id: true, username: true, email: true, phone: true } },
-            tenant: { select: { id: true, username: true, email: true, phone: true } },
-            property: true,
+    AzureLogger.info("[getContractById] Start", { contractId, userId });
+    try {
+        const contract = await prisma.contract.findUnique({
+            where: { id: contractId },
+            include: {
+                landlord: { select: { id: true, username: true, email: true, phone: true } },
+                tenant: { select: { id: true, username: true, email: true, phone: true } },
+                property: true,
+            }
+        });
+        if (!contract) {
+            AzureLogger.error(new Error('Contract not found.'), { contractId });
+            throw { status: 404, message: 'Contract not found.' };
         }
-    });
-    if (!contract) throw { status: 404, message: 'Contract not found.' };
-    
-    // Authorization: only the involved parties can see it
-    if (contract.landlordId !== userId && contract.tenantId !== userId) {
-        throw { status: 403, message: 'You are not authorized to view this contract.' };
+        // Authorization: only the involved parties can see it
+        if (contract.landlordId !== userId && contract.tenantId !== userId) {
+            AzureLogger.error(new Error('Unauthorized contract access.'), { contractId, userId });
+            throw { status: 403, message: 'You are not authorized to view this contract.' };
+        }
+        AzureLogger.info("[getContractById] Success", { contractId, userId });
+        return contract;
+    } catch (err) {
+        AzureLogger.error(err, { contractId, userId, operation: "getContractById" });
+        throw err;
     }
-    return contract;
 };
 
 const listUserContracts = async (userId) => {
-    return prisma.contract.findMany({
-        where: {
-            OR: [
-                { landlordId: userId },
-                { tenantId: userId }
-            ]
-        },
-        include: { 
-            property: { select: { id: true, title: true, address: true } }, 
-            tenant: { select: { id: true, username: true } }, 
-            landlord: { select: { id: true, username: true } }
-        },
-        orderBy: { createdAt: 'desc' }
-    });
+    AzureLogger.info("[listUserContracts] Start", { userId });
+    try {
+        const contracts = await prisma.contract.findMany({
+            where: {
+                OR: [
+                    { landlordId: userId },
+                    { tenantId: userId }
+                ]
+            },
+            include: { 
+                property: { select: { id: true, title: true, address: true } }, 
+                tenant: { select: { id: true, username: true } }, 
+                landlord: { select: { id: true, username: true } }
+            },
+            orderBy: { createdAt: 'desc' }
+        });
+        AzureLogger.info("[listUserContracts] Success", { userId, count: contracts.length });
+        return contracts;
+    } catch (err) {
+        AzureLogger.error(err, { userId, operation: "listUserContracts" });
+        throw err;
+    }
 };
 
 

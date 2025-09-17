@@ -1,4 +1,5 @@
 import { BlobServiceClient, StorageSharedKeyCredential, generateBlobSASQueryParameters, BlobSASPermissions } from "@azure/storage-blob";
+import { AzureLogger } from "./azureLogger.js";
 import { PrismaClient, DocumentType, DocumentStatus } from "../generated/prisma/index.js";
 import { v4 as uuidv4 } from "uuid";
 import path from 'path';
@@ -71,48 +72,53 @@ const validateDocumentRequest = (documentType, size, mimeType) => {
  * @returns {Promise<{uploadUrl: string, documentId: number}>} The SAS URL and the new document's ID.
  */
 const prepareUpload = async ({ originalName, mimeType, size, type, propertyId = null, userId }) => {
-  
-  validateDocumentRequest(type, size, mimeType);
+  AzureLogger.info("[prepareUpload] Start", { userId, type, propertyId });
+  try {
+    validateDocumentRequest(type, size, mimeType);
 
-  // Authorize: check if the user is the owner of the property for property-related documents.
-  if (propertyId) {
-      const property = await prisma.property.findUnique({ where: { id: parseInt(propertyId) } });
-      if (!property) throw { status: 404, message: 'Property not found.' };
-      if (property.ownerId !== userId) throw { status: 403, message: 'You are not the owner of this property.' };
+    // Authorize: check if the user is the owner of the property for property-related documents.
+    if (propertyId) {
+        const property = await prisma.property.findUnique({ where: { id: parseInt(propertyId) } });
+        if (!property) throw { status: 404, message: 'Property not found.' };
+        if (property.ownerId !== userId) throw { status: 403, message: 'You are not the owner of this property.' };
+    }
+
+    // Create a unique filename and virtual folder path for security and organization.
+    const extension = path.extname(originalName);
+    const uniqueFileName = `${type.toLowerCase()}/${uuidv4()}${extension}`; 
+
+    const document = await prisma.document.create({
+      data: {
+        uniqueFileName,
+        originalName,
+        mimeType,
+        size,
+        type,
+        storageUrl: '', // Will be populated upon confirmation.
+        status: DocumentStatus.PENDING_VALIDATION,
+        uploadedById: userId,
+        propertyId: propertyId ? parseInt(propertyId) : undefined,
+      },
+    });
+
+    const blockBlobClient = containerClient.getBlockBlobClient(uniqueFileName);
+
+    const sasToken = await generateBlobSASQueryParameters({
+      containerName,
+      blobName: uniqueFileName,
+      permissions: BlobSASPermissions.parse("w"), // Write-only permission
+      startsOn: new Date(),
+      expiresOn: new Date(new Date().valueOf() + SAS_EXPIRATION_MINUTES  * 60 * 1000), 
+      contentType: mimeType,
+    }, sharedKeyCredential).toString();
+
+    const uploadUrl = `${blockBlobClient.url}?${sasToken}`;
+    AzureLogger.info("[prepareUpload] Success", { userId, documentId: document.id });
+    return { uploadUrl, documentId: document.id };
+  } catch (err) {
+    AzureLogger.error(err, { userId, type, propertyId, operation: "prepareUpload" });
+    throw err;
   }
-
-  // Create a unique filename and virtual folder path for security and organization.
-  const extension = path.extname(originalName);
-  const uniqueFileName = `${type.toLowerCase()}/${uuidv4()}${extension}`; 
-
-  const document = await prisma.document.create({
-    data: {
-      uniqueFileName,
-      originalName,
-      mimeType,
-      size,
-      type,
-      storageUrl: '', // Will be populated upon confirmation.
-      status: DocumentStatus.PENDING_VALIDATION,
-      uploadedById: userId,
-      propertyId: propertyId ? parseInt(propertyId) : undefined,
-    },
-  });
-
-  const blockBlobClient = containerClient.getBlockBlobClient(uniqueFileName);
-
-  const sasToken = await generateBlobSASQueryParameters({
-    containerName,
-    blobName: uniqueFileName,
-    permissions: BlobSASPermissions.parse("w"), // Write-only permission
-    startsOn: new Date(),
-    expiresOn: new Date(new Date().valueOf() + SAS_EXPIRATION_MINUTES  * 60 * 1000), 
-    contentType: mimeType,
-  }, sharedKeyCredential).toString();
-
-  const uploadUrl = `${blockBlobClient.url}?${sasToken}`;
-  
-  return { uploadUrl, documentId: document.id };
 };
 
 /**
@@ -122,22 +128,30 @@ const prepareUpload = async ({ originalName, mimeType, size, type, propertyId = 
  * @returns {Promise<object>} The updated document record.
  */
 const confirmUpload = async (documentId, userId) => {
-  const document = await prisma.document.findFirst({
-    where: { id: documentId, uploadedById: userId },
-  });
-  if (!document) throw { status: 404, message: 'Document not found or unauthorized.' };
-  
-  const blockBlobClient = containerClient.getBlockBlobClient(document.uniqueFileName);
-  if (!(await blockBlobClient.exists())) {
-    // Clean up orphan DB record if file was never uploaded.
-    await prisma.document.delete({ where: { id: documentId } });
-    throw { status: 400, message: 'Upload confirmation failed: File not found in storage.' };
-  }
+  AzureLogger.info("[confirmUpload] Start", { userId, documentId });
+  try {
+    const document = await prisma.document.findFirst({
+      where: { id: documentId, uploadedById: userId },
+    });
+    if (!document) throw { status: 404, message: 'Document not found or unauthorized.' };
+    
+    const blockBlobClient = containerClient.getBlockBlobClient(document.uniqueFileName);
+    if (!(await blockBlobClient.exists())) {
+      // Clean up orphan DB record if file was never uploaded.
+      await prisma.document.delete({ where: { id: documentId } });
+      throw { status: 400, message: 'Upload confirmation failed: File not found in storage.' };
+    }
 
-  return prisma.document.update({
-    where: { id: documentId },
-    data: { storageUrl: blockBlobClient.url },
-  });
+    const updated = await prisma.document.update({
+      where: { id: documentId },
+      data: { storageUrl: blockBlobClient.url },
+    });
+    AzureLogger.info("[confirmUpload] Success", { userId, documentId });
+    return updated;
+  } catch (err) {
+    AzureLogger.error(err, { userId, documentId, operation: "confirmUpload" });
+    throw err;
+  }
 };
 
 /**
@@ -148,16 +162,18 @@ const confirmUpload = async (documentId, userId) => {
  * @returns {Promise<object>} The updated document record.
  */
 const reviewDocument = async (documentId, newStatus, reviewingUserId) => {
-     if (!Object.values(DocumentStatus).includes(newStatus)) {
-        throw { status: 400, message: 'Invalid document status.' };
+  AzureLogger.info("[reviewDocument] Start", { reviewingUserId, documentId, newStatus });
+  try {
+    if (!Object.values(DocumentStatus).includes(newStatus)) {
+      throw { status: 400, message: 'Invalid document status.' };
     }
 
     const document = await prisma.document.findUniqueOrThrow({
-        where: { id: documentId },
-        include: { 
-            property: true, // Incluimos la propiedad si está asociada
-            uploadedBy: true, // Incluimos al usuario que subió el doc
-        },
+      where: { id: documentId },
+      include: { 
+        property: true, // Incluimos la propiedad si está asociada
+        uploadedBy: true, // Incluimos al usuario que subió el doc
+      },
     });
 
     // Authorization Logic: determines if the reviewer has permission.
@@ -165,34 +181,40 @@ const reviewDocument = async (documentId, newStatus, reviewingUserId) => {
 
     // Case 1: The reviewer is the owner of the property linked to the document.
     if (document.propertyId) {
-        if (document.property.ownerId === reviewingUserId) {
-            isAuthorized = true;
-        }
+      if (document.property.ownerId === reviewingUserId) {
+        isAuthorized = true;
+      }
     } 
     // Case 2: The document is a tenant's, check for a rental application link.
     else {
-        const rentalApplication = await prisma.rental.findFirst({
-            where: {
-                renterId: document.uploadedById, // El que subió el doc
-                property: {
-                    ownerId: reviewingUserId, // El que está intentando revisar
-                },
-            },
-        });
+      const rentalApplication = await prisma.rental.findFirst({
+        where: {
+          renterId: document.uploadedById, // El que subió el doc
+          property: {
+            ownerId: reviewingUserId, // El que está intentando revisar
+          },
+        },
+      });
 
-        if (rentalApplication) {
-            isAuthorized = true;
-        }
+      if (rentalApplication) {
+        isAuthorized = true;
+      }
     }
 
     if (!isAuthorized) {
-        throw { status: 403, message: 'You are not authorized to review this document.' };
+      throw { status: 403, message: 'You are not authorized to review this document.' };
     }
 
-    return prisma.document.update({
-        where: { id: documentId },
-        data: { status: newStatus },
+    const updated = await prisma.document.update({
+      where: { id: documentId },
+      data: { status: newStatus },
     });
+    AzureLogger.info("[reviewDocument] Success", { reviewingUserId, documentId, newStatus });
+    return updated;
+  } catch (err) {
+    AzureLogger.error(err, { reviewingUserId, documentId, newStatus, operation: "reviewDocument" });
+    throw err;
+  }
 };
 
 /**
@@ -201,10 +223,18 @@ const reviewDocument = async (documentId, newStatus, reviewingUserId) => {
  * @returns {Promise<object[]>} A list of the user's documents.
  */
 const getMyDocuments = async (userId) => {
-    return prisma.document.findMany({
-        where: { uploadedById: userId },
-        orderBy: { createdAt: 'desc' },
+  AzureLogger.info("[getMyDocuments] Start", { userId });
+  try {
+    const docs = await prisma.document.findMany({
+      where: { uploadedById: userId },
+      orderBy: { createdAt: 'desc' },
     });
+    AzureLogger.info("[getMyDocuments] Success", { userId, count: docs.length });
+    return docs;
+  } catch (err) {
+    AzureLogger.error(err, { userId, operation: "getMyDocuments" });
+    throw err;
+  }
 };
 
 /**
@@ -214,9 +244,11 @@ const getMyDocuments = async (userId) => {
  * @returns {Promise<string>} The temporary download URL.
  */
 const getDocumentDownloadUrl = async (documentId, requestingUserId) => {
+  AzureLogger.info("[getDocumentDownloadUrl] Start", { requestingUserId, documentId });
+  try {
     const document = await prisma.document.findUniqueOrThrow({
-        where: { id: documentId },
-        include: { property: true },
+      where: { id: documentId },
+      include: { property: true },
     });
 
     // Authorization Logic: checks if the requester has permission.
@@ -224,45 +256,50 @@ const getDocumentDownloadUrl = async (documentId, requestingUserId) => {
 
     // Rule 1: The uploader can always access their own document.
     if (document.uploadedById === requestingUserId) {
-        isAuthorized = true;
+      isAuthorized = true;
     }
-    
+        
     // Rule 2: The owner of the linked property can access it.
     if (!isAuthorized && document.propertyId) {
-        if (document.property.ownerId === requestingUserId) {
-            isAuthorized = true;
-        }
+      if (document.property.ownerId === requestingUserId) {
+        isAuthorized = true;
+      }
     }
-    
+        
     // Rule 3: A landlord can access a tenant's document if there's a rental application.
     if (!isAuthorized && !document.propertyId) {
-        const rentalApplication = await prisma.rental.findFirst({
-            where: {
-                renterId: document.uploadedById,
-                property: {
-                    ownerId: requestingUserId,
-                },
-            },
-        });
+      const rentalApplication = await prisma.rental.findFirst({
+        where: {
+          renterId: document.uploadedById,
+          property: {
+            ownerId: requestingUserId,
+          },
+        },
+      });
 
-        if (rentalApplication) {
-            isAuthorized = true;
-        }
+      if (rentalApplication) {
+        isAuthorized = true;
+      }
     }
 
     if (!isAuthorized) {
-        throw { status: 403, message: 'You are not authorized to access this document.' };
+      throw { status: 403, message: 'You are not authorized to access this document.' };
     }
 
     const blockBlobClient = containerClient.getBlockBlobClient(document.uniqueFileName);
     const sasToken = await generateBlobSASQueryParameters({
-        containerName,
-        blobName: document.uniqueFileName,
-        permissions: BlobSASPermissions.parse("r"), // Read
-        expiresOn: new Date(new Date().valueOf() + SAS_EXPIRATION_MINUTES * 60 * 1000), // 10 minutos
+      containerName,
+      blobName: document.uniqueFileName,
+      permissions: BlobSASPermissions.parse("r"), // Read
+      expiresOn: new Date(new Date().valueOf() + SAS_EXPIRATION_MINUTES * 60 * 1000), // 10 minutos
     }, sharedKeyCredential).toString();
 
+    AzureLogger.info("[getDocumentDownloadUrl] Success", { requestingUserId, documentId });
     return `${blockBlobClient.url}?${sasToken}`;
+  } catch (err) {
+    AzureLogger.error(err, { requestingUserId, documentId, operation: "getDocumentDownloadUrl" });
+    throw err;
+  }
 };
 
 /**
@@ -273,76 +310,91 @@ const getDocumentDownloadUrl = async (documentId, requestingUserId) => {
  * @returns {Promise<{success: boolean, message: string}>} A confirmation object upon successful deletion.
  */
 const deleteDocument = async (documentId, requestingUserId) => {
+  AzureLogger.info("[deleteDocument] Start", { requestingUserId, documentId });
   // Find document and verify ownership in a single step.
-  const document = await prisma.document.findUnique({
-    where: { id: documentId },
-  });
-
-  if (!document) {
-    throw new Error('Document not found');
-  }
-  
-  // Check if user owns the document
-  if (document.uploadedById !== requestingUserId) {
-    throw { status: 403, message: 'You are not authorized to delete this document.' };
-  }
-
-  // Delete from blob storage
   try {
-    const blockBlobClient = containerClient.getBlockBlobClient(document.uniqueFileName);
-    // `deleteIfExists` is idempotent: it won't throw an error if the blob is already gone.
-    await blockBlobClient.deleteIfExists();
-  } catch (error) {
-    console.error(`Azure Blob Storage Error: Could not delete blob ${document.uniqueFileName}:`, error);
-    throw { status: 500, message: 'Failed to delete file from storage.'};
-  }
-  
-  // If blob deletion is successful, delete the record from the database.
-  await prisma.document.delete({
-    where: { id: documentId },
-  });
+    const document = await prisma.document.findUnique({
+      where: { id: documentId },
+    });
 
-  return { success: true, message: 'Document deleted successfully' };
+    if (!document) {
+      throw new Error('Document not found');
+    }
+    
+    // Check if user owns the document
+    if (document.uploadedById !== requestingUserId) {
+      throw { status: 403, message: 'You are not authorized to delete this document.' };
+    }
+
+    // Delete from blob storage
+    try {
+      const blockBlobClient = containerClient.getBlockBlobClient(document.uniqueFileName);
+      // `deleteIfExists` is idempotent: it won't throw an error if the blob is already gone.
+      await blockBlobClient.deleteIfExists();
+    } catch (error) {
+      AzureLogger.error(error, { requestingUserId, documentId, operation: "deleteDocument" });
+      throw { status: 500, message: 'Failed to delete file from storage.'};
+    }
+    
+    // If blob deletion is successful, delete the record from the database.
+    await prisma.document.delete({
+      where: { id: documentId },
+    });
+
+    AzureLogger.info("[deleteDocument] Success", { requestingUserId, documentId });
+    return { success: true, message: 'Document deleted successfully' };
+  } catch (err) {
+    AzureLogger.error(err, { requestingUserId, documentId, operation: "deleteDocument" });
+    throw err;
+  }
 };
 
 const superUpload = async ({ originalName, mimeType, size, type, propertyId = null, userId, buffer }) => {
-  validateDocumentRequest(type, size, mimeType);
-  
-  // Authorize: check if the user is the owner of the property for property-related documents.
-  if (propertyId) {
-      const property = await prisma.property.findUnique({ where: { id: parseInt(propertyId) } });
-      if (!property) throw { status: 404, message: 'Property not found.' };
-      if (property.ownerId !== userId) throw { status: 403, message: 'You are not the owner of this property.' };
-  }
-
-  // Create a unique filename and virtual folder path for security and organization.
-  const extension = path.extname(originalName);
-  const uniqueFileName = `${type.toLowerCase()}/${uuidv4()}${extension}`; 
-
-  const blockBlobClient = containerClient.getBlockBlobClient(uniqueFileName);
+  AzureLogger.info("[superUpload] Start", { userId, type, propertyId });
   try {
-  await blockBlobClient.uploadData(buffer, {
-    blobHTTPHeaders: { blobContentType: mimeType },
-  });
+    validateDocumentRequest(type, size, mimeType);
+    
+    // Authorize: check if the user is the owner of the property for property-related documents.
+    if (propertyId) {
+        const property = await prisma.property.findUnique({ where: { id: parseInt(propertyId) } });
+        if (!property) throw { status: 404, message: 'Property not found.' };
+        if (property.ownerId !== userId) throw { status: 403, message: 'You are not the owner of this property.' };
+    }
+
+    // Create a unique filename and virtual folder path for security and organization.
+    const extension = path.extname(originalName);
+    const uniqueFileName = `${type.toLowerCase()}/${uuidv4()}${extension}`; 
+
+    const blockBlobClient = containerClient.getBlockBlobClient(uniqueFileName);
+    try {
+      await blockBlobClient.uploadData(buffer, {
+        blobHTTPHeaders: { blobContentType: mimeType },
+      });
+    } catch (err) {
+      AzureLogger.error(err, { userId, type, propertyId, operation: "superUpload" });
+      throw { status: 500, message: "Error subiendo archivo a Blob Storage", detail: err.message };
+    }
+
+    const document = await prisma.document.create({
+      data: {
+        uniqueFileName,
+        originalName,
+        mimeType,
+        size,
+        type,
+        storageUrl: blockBlobClient.url,
+        status: DocumentStatus.PENDING_VALIDATION,
+        uploadedById: userId,
+        propertyId: propertyId ? parseInt(propertyId) : undefined,
+      },
+    });
+
+    AzureLogger.info("[superUpload] Success", { userId, documentId: document.id });
+    return document;
   } catch (err) {
-    throw { status: 500, message: "Error subiendo archivo a Blob Storage", detail: err.message };
+    AzureLogger.error(err, { userId, type, propertyId, operation: "superUpload" });
+    throw err;
   }
-
-  const document = await prisma.document.create({
-    data: {
-      uniqueFileName,
-      originalName,
-      mimeType,
-      size,
-      type,
-      storageUrl: blockBlobClient.url,
-      status: DocumentStatus.PENDING_VALIDATION,
-      uploadedById: userId,
-      propertyId: propertyId ? parseInt(propertyId) : undefined,
-    },
-  });
-
-  return document;
 }
 
 export const documentsService = {
