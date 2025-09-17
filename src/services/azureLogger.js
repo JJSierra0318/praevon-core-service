@@ -1,11 +1,10 @@
-import appInsights from 'applicationinsights';
+import appInsights from "applicationinsights";
 
-// Initialize Application Insights
-if (process.env.APPINSIGHTS_INSTRUMENTATIONKEY) {
-  appInsights.setup(process.env.APPINSIGHTS_INSTRUMENTATIONKEY).start();
+let client;
+if (process.env.APPINSIGHTS_INSTRUMENTATIONKEY || process.env.APPLICATIONINSIGHTS_CONNECTION_STRING) {
+  appInsights.setup().start();
+  client = appInsights.defaultClient;
 }
-
-const client = appInsights.defaultClient;
 
 export const AzureLogger = {
   info: (message, properties = {}) => {
